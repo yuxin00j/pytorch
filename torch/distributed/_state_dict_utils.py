@@ -534,12 +534,19 @@ class _TensorInfo(NamedTuple):
     dtype: torch.dtype
 
 
+# Matches ``DistributedDataParallel.broadcast_bucket_size``. Tensors are grouped
+# up to this many bytes per collective so that a model with many small
+# parameters is not bound by per-collective latency.
+_BROADCAST_BUCKET_BYTES = 250 * 1024 * 1024
+
+
 def _broadcast_tensors(
     full_state_dict: dict[str, Any],
     local_state_dict: dict[str, Any],
     keys: list[str],
     device: torch.device,
     pg: dist.ProcessGroup | None = None,
+    bucket_bytes: int = _BROADCAST_BUCKET_BYTES,
 ) -> None:
     if pg is None:
         pg = dist.distributed_c10d._get_default_group()
@@ -571,26 +578,25 @@ def _broadcast_tensors(
 
         local_state_dict[key] = (
             (local_state, full_tensor)
-            if isinstance(local_state, DTensor)
+            if isinstance(local_state, torch.Tensor)
             else full_tensor
         )
 
     if len(tensors) > 1:
-        dist._broadcast_coalesced(pg, tensors, 500, 0)
+        dist._broadcast_coalesced(pg, tensors, bucket_bytes, 0)
     else:
         dist.broadcast(tensors[0], src=0, group=pg)
 
     if pg_device != device:
         for key, full_tensor in zip(keys, tensors):
             if (local_state := local_state_dict.get(key)) is not None:
-                local_state_dict[key] = (
-                    (local_state[0], full_tensor.to(device))
-                    if (
-                        isinstance(local_state, tuple)
-                        and isinstance(local_state[0], DTensor)
-                    )
-                    else full_tensor.to(device)
-                )
+                if isinstance(local_state, tuple) and isinstance(
+                    local_state[0], torch.Tensor
+                ):
+                    if isinstance(local_state[0], DTensor) or local_state[0].is_meta:
+                        local_state_dict[key] = (local_state[0], full_tensor.to(device))
+                else:
+                    local_state_dict[key] = full_tensor.to(device)
 
     _distribute_tensors(local_state_dict, keys, device, pg)
 
@@ -610,6 +616,14 @@ def _distribute_tensors(
 
         local_state = _local_state[0]
         full_tensor = _local_state[1]
+
+        if not isinstance(local_state, DTensor):
+            if not local_state.is_meta and local_state.shape == full_tensor.shape:
+                local_state.detach().copy_(full_tensor)
+                local_state_dict[key] = local_state
+            else:
+                local_state_dict[key] = full_tensor.to(device)
+            continue
 
         shape, offset = compute_local_shape_and_global_offset(
             full_tensor.shape, local_state.device_mesh, local_state.placements
@@ -644,6 +658,7 @@ def _broadcast_state_dict(
     pg: dist.ProcessGroup | None = None,
     strict: bool = False,
     cpu_offload: bool = False,
+    bucket_bytes: int = _BROADCAST_BUCKET_BYTES,
 ) -> None:
     # Broadcast from rank0's `full_state_dict` to all ranks' `local_state_dict`.
     # If strict is True, any keys in `local_state_dict` but not in `full_state_dict`
@@ -663,6 +678,7 @@ def _broadcast_state_dict(
     ret = broadcast_list[0]
     # Gather values
     keys = []
+    pending_bytes = 0
     local_state_dict_keys = set(local_state_dict.keys())
     global_keys = set()
     for key, value in ret.items():
@@ -676,13 +692,20 @@ def _broadcast_state_dict(
             ret[key] = full_state_dict[key]
 
         keys.append(key)
-        # Broadcast every tensor to avoid OOM for now.
-        if len(keys) >= 1:
-            _broadcast_tensors(ret, local_state_dict, keys, device, pg)
-            if cpu_offload:
-                for key in keys:
-                    local_state_dict[key] = local_state_dict[key].cpu()
+        # Group tensors into buckets rather than issuing one collective per
+        # tensor. `value` is the `_TensorInfo` that every rank received above,
+        # so all ranks accumulate the same sizes and flush at the same points.
+        # A tensor larger than the bucket still gets a collective to itself,
+        # which keeps the original bound on transient memory.
+        pending_bytes += value.size.numel() * value.dtype.itemsize
+        if pending_bytes >= bucket_bytes:
+            _broadcast_tensors(ret, local_state_dict, keys, device, pg, bucket_bytes)
+            for k in keys:
+                ret[k] = None
+                if cpu_offload:
+                    local_state_dict[k] = local_state_dict[k].cpu()
             keys.clear()
+            pending_bytes = 0
 
     if strict:
         if missing_keys := (local_state_dict_keys - global_keys):
@@ -690,10 +713,11 @@ def _broadcast_state_dict(
                 local_state_dict.pop(key)
 
     if keys:
-        _broadcast_tensors(ret, local_state_dict, keys, device, pg)
-        if cpu_offload:
-            for key in keys:
-                local_state_dict[key] = local_state_dict[key].cpu()
+        _broadcast_tensors(ret, local_state_dict, keys, device, pg, bucket_bytes)
+        for k in keys:
+            ret[k] = None
+            if cpu_offload:
+                local_state_dict[k] = local_state_dict[k].cpu()
 
 
 def _distribute_state_dict(

@@ -1,6 +1,7 @@
 # Owner(s): ["oncall: distributed"]
 import copy
 import io
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -12,6 +13,9 @@ from torch.distributed._shard.sharded_tensor import (
     ShardMetadata,
 )
 from torch.distributed._state_dict_utils import (
+    _BROADCAST_BUCKET_BYTES,
+    _broadcast_state_dict,
+    _broadcast_tensors,
     _check_state_dict_similarity,
     _copy_state_dict,
     _create_cpu_state_dict,
@@ -299,6 +303,61 @@ class TestStateDictUtils(DTensorTestBase):
         _copy_state_dict(sd, cpu_sd, non_blocking=True)
         torch.accelerator.synchronize()
         self.assertTrue(torch.equal(sd["k"].cpu(), cpu_sd["k"]))
+
+
+class TestBroadcastStateDict(DTensorTestBase):
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    def _broadcast_and_count(self, bucket_bytes, n_tensors, numel):
+        """Broadcast ``n_tensors`` and return how many collectives it took."""
+        full_state_dict = {}
+        if dist.get_rank() == 0:
+            full_state_dict = {
+                f"w{i}": torch.full((numel,), float(i)) for i in range(n_tensors)
+            }
+        local_state_dict = {f"w{i}": torch.zeros(numel) for i in range(n_tensors)}
+        orig_ptrs = {k: v.data_ptr() for k, v in local_state_dict.items()}
+
+        calls = 0
+        original = _broadcast_tensors
+
+        def counting(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        with patch("torch.distributed._state_dict_utils._broadcast_tensors", counting):
+            _broadcast_state_dict(
+                full_state_dict,
+                local_state_dict,
+                device=torch.device("cpu"),
+                bucket_bytes=bucket_bytes,
+            )
+
+        for i in range(n_tensors):
+            self.assertEqual(local_state_dict[f"w{i}"], torch.full((numel,), float(i)))
+            self.assertEqual(local_state_dict[f"w{i}"].data_ptr(), orig_ptrs[f"w{i}"])
+        return calls
+
+    @with_comms
+    def test_broadcast_state_dict_bucketing(self):
+        n_tensors, numel = 64, 1024
+        # bucket_bytes=0 always clears the threshold, which reproduces the
+        # historical one-collective-per-tensor behaviour.
+        self.assertEqual(self._broadcast_and_count(0, n_tensors, numel), n_tensors)
+        # 256 KiB of payload fits in one default bucket, so only the tail flush
+        # runs.
+        self.assertEqual(
+            self._broadcast_and_count(_BROADCAST_BUCKET_BYTES, n_tensors, numel), 1
+        )
+
+    @with_comms
+    def test_broadcast_state_dict_tensor_larger_than_bucket(self):
+        # Each 4 KiB tensor fills the bucket on its own, so the transient memory
+        # bound the per-tensor flush used to provide is preserved.
+        self.assertEqual(self._broadcast_and_count(4 * 1024, 4, 1024), 4)
 
 
 if __name__ == "__main__":
