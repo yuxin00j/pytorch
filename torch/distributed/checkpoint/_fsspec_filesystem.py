@@ -1,6 +1,7 @@
 # Mypy will not try inferring the types of any 3rd party libraries installed.
 # mypy: ignore-errors
 
+import collections
 import concurrent.futures
 import io
 import itertools
@@ -214,6 +215,7 @@ class FsspecReader(FileSystemReader):
         super().__init__(path)
         self.max_batch_size = max(1, max_batch_size)
         self.max_batch_bytes = max(1, max_batch_bytes)
+        self.prefetch_depth = 4
         if cpu_workers is None:
             local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", 1)))
             total_cpus = os.cpu_count() or 4
@@ -301,24 +303,34 @@ class FsspecReader(FileSystemReader):
             # off the calling thread.
             return self._decode_item(req, io.BytesIO(chunk_data))
 
+        depth = self.prefetch_depth
         with (
             concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.cpu_workers
             ) as cpu_executor,
-            concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_executor,
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=depth
+            ) as prefetch_executor,
         ):
-            next_io: concurrent.futures.Future | None = None
+            inflight: collections.deque[concurrent.futures.Future] = (
+                collections.deque()
+            )
             try:
-                next_io = prefetch_executor.submit(fetch_batch, batches[0])
+                submitted = 0
+                while submitted < min(depth, len(batches)):
+                    inflight.append(
+                        prefetch_executor.submit(fetch_batch, batches[submitted])
+                    )
+                    submitted += 1
 
-                for idx in range(len(batches)):
-                    chunks, b_reqs = next_io.result()
-                    next_io = None
+                for _ in range(len(batches)):
+                    chunks, b_reqs = inflight.popleft().result()
 
-                    if idx + 1 < len(batches):
-                        next_io = prefetch_executor.submit(
-                            fetch_batch, batches[idx + 1]
+                    if submitted < len(batches):
+                        inflight.append(
+                            prefetch_executor.submit(fetch_batch, batches[submitted])
                         )
+                        submitted += 1
 
                     decoded = [
                         cpu_executor.submit(decode, req, chunk_data)
@@ -368,8 +380,8 @@ class FsspecReader(FileSystemReader):
                 # so on failure it would drain the queue instead of dropping it.
                 # Waiting is left to __exit__; the in-flight prefetch is
                 # cancelled so its result is not silently discarded.
-                if next_io is not None:
-                    next_io.cancel()
+                for f in inflight:
+                    f.cancel()
                 cpu_executor.shutdown(wait=False, cancel_futures=True)
 
         fut: Future[None] = Future()
