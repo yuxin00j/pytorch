@@ -214,6 +214,8 @@ class FsspecReader(FileSystemReader):
         super().__init__(path)
         self.max_batch_size = max(1, max_batch_size)
         self.max_batch_bytes = max(1, max_batch_bytes)
+        self.max_span_bytes = 8 * 1024 * 1024
+        self.max_gap_bytes = 256 * 1024
         if cpu_workers is None:
             local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", 1)))
             total_cpus = os.cpu_count() or 4
@@ -248,43 +250,73 @@ class FsspecReader(FileSystemReader):
             ),
         )
 
-        batches = []
-        batch = []
-        paths = []
-        starts = []
-        ends = []
-        batch_bytes = 0
-
+        # A group is a list of byte spans plus the items carved out of them.
+        # Adjacent small items share one span; a large item is split across
+        # several spans. Groups never straddle batches.
+        target = self.max_span_bytes
+        max_gap = self.max_gap_bytes
+        groups: list[tuple[list[tuple[str, int, int]], list]] = []
+        cur = None  # [path, start, end, items]
         for req in reqs:
             item_md = self.storage_data[req.storage_index]
-            if batch and (
-                len(batch) >= self.max_batch_size
-                or batch_bytes + item_md.length > self.max_batch_bytes
+            path = self.fs.concat_path(self.path, item_md.relative_path)
+            s, e = item_md.offset, item_md.offset + item_md.length
+            if (
+                cur is not None
+                and cur[0] == path
+                and 0 <= s - cur[2] <= max_gap
+                and e - cur[1] <= target
             ):
-                batches.append((paths, starts, ends, batch))
-                batch = []
-                paths = []
-                starts = []
-                ends = []
-                batch_bytes = 0
-            batch.append(req)
-            paths.append(self.fs.concat_path(self.path, item_md.relative_path))
-            starts.append(item_md.offset)
-            ends.append(item_md.offset + item_md.length)
-            batch_bytes += item_md.length
+                cur[2] = e
+                cur[3].append((req, [(0, s - cur[1], e - cur[1])]))
+                continue
+            if cur is not None:
+                groups.append(([(cur[0], cur[1], cur[2])], cur[3]))
+                cur = None
+            if item_md.length > target:
+                n = -(-item_md.length // target)
+                step = -(-item_md.length // n)
+                spans = [(path, o, min(o + step, e)) for o in range(s, e, step)]
+                groups.append(
+                    (spans, [(req, [(i, 0, sp[2] - sp[1]) for i, sp in enumerate(spans)])])
+                )
+            else:
+                cur = [path, s, e, [(req, [(0, 0, e - s)])]]
+        if cur is not None:
+            groups.append(([(cur[0], cur[1], cur[2])], cur[3]))
 
+        batches = []
+        batch: list = []
+        n_spans = 0
+        batch_bytes = 0
+        for g in groups:
+            g_bytes = sum(sp[2] - sp[1] for sp in g[0])
+            if batch and (
+                n_spans + len(g[0]) > self.max_batch_size
+                or batch_bytes + g_bytes > self.max_batch_bytes
+            ):
+                batches.append(batch)
+                batch, n_spans, batch_bytes = [], 0, 0
+            batch.append(g)
+            n_spans += len(g[0])
+            batch_bytes += g_bytes
         if batch:
-            batches.append((paths, starts, ends, batch))
+            batches.append(batch)
 
         def fetch_batch(b):
-            bp, bs, be, br = b
+            bp, bs, be = [], [], []
+            for spans, _ in b:
+                for p, s, e in spans:
+                    bp.append(p)
+                    bs.append(s)
+                    be.append(e)
             chunks = self.fs.fs.cat_ranges(bp, bs, be, on_error="raise")
             # A short list means some ranges were dropped (``on_error="omit"``).
-            # Left unchecked, the zip below would silently skip those items and
+            # Left unchecked, the items below would silently be skipped and
             # leave their tensors at whatever the caller initialized them to.
-            if len(chunks) != len(br):
+            if len(chunks) != len(bp):
                 raise RuntimeError(
-                    f"cat_ranges returned {len(chunks)} chunks for {len(br)} ranges"
+                    f"cat_ranges returned {len(chunks)} chunks for {len(bp)} ranges"
                 )
             # ``on_error`` is advisory: fsspec honors it only since 2026.7.0 and
             # other backends may ignore it, returning exceptions in-band.
@@ -294,12 +326,25 @@ class FsspecReader(FileSystemReader):
                     raise RuntimeError(
                         f"Failed to read bytes [{start}, {end}) from {path}"
                     ) from chunk
-            return chunks, br
+                if len(chunk) != end - start:
+                    raise RuntimeError(
+                        f"Short read of bytes [{start}, {end}) from {path}: got {len(chunk)}"
+                    )
+            b_reqs, pieces = [], []
+            pos = 0
+            for spans, items in b:
+                views = [memoryview(c) for c in chunks[pos : pos + len(spans)]]
+                pos += len(spans)
+                for req, slices in items:
+                    b_reqs.append(req)
+                    pieces.append([views[i][lo:hi] for i, lo, hi in slices])
+            return pieces, b_reqs
 
-        def decode(req, chunk_data):
+        def decode(req, parts):
             # Wrapping here rather than at submit time keeps the buffer copy
             # off the calling thread.
-            return self._decode_item(req, io.BytesIO(chunk_data))
+            data = parts[0] if len(parts) == 1 else b"".join(parts)
+            return self._decode_item(req, io.BytesIO(data))
 
         with (
             concurrent.futures.ThreadPoolExecutor(
