@@ -208,7 +208,7 @@ class FsspecReader(FileSystemReader):
                 still being decoded and copied, so expect a small multiple of this
                 to be live at peak.
             cpu_workers: Number of worker threads for parallel CPU deserialization.
-                Defaults to min(16, max(1, cpu_count // local_world_size)).
+                Defaults to min(4, max(1, cpu_count // local_world_size)).
             **kwargs: Additional storage options passed to fsspec url_to_fs.
         """
         super().__init__(path)
@@ -217,7 +217,7 @@ class FsspecReader(FileSystemReader):
         if cpu_workers is None:
             local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", 1)))
             total_cpus = os.cpu_count() or 4
-            cpu_workers = min(16, max(1, total_cpus // local_world_size))
+            cpu_workers = min(4, max(1, total_cpus // local_world_size))
         self.cpu_workers = max(1, cpu_workers)
         self.fs = FileSystem()
         self.path = self.fs.init_path(path, **kwargs)
