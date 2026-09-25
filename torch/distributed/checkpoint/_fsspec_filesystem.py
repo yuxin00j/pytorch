@@ -234,8 +234,8 @@ class FsspecReader(FileSystemReader):
         self,
         path: str | os.PathLike,
         *,
-        max_batch_size: int = 64,
-        max_batch_bytes: int = 256 * 1024 * 1024,
+        max_batch_size: int = 128,
+        max_batch_bytes: int = 512 * 1024 * 1024,
         merge_item_bytes: int = 1024 * 1024,
         range_bytes: int = 16 * 1024 * 1024,
         cpu_workers: int | None = None,
@@ -247,9 +247,9 @@ class FsspecReader(FileSystemReader):
         Args:
             path: directory or URL where the checkpoint will be read from.
             max_batch_size: Maximum number of ranges per batched cat_ranges call.
-                Defaults to 64.
+                Defaults to 128.
             max_batch_bytes: Maximum cumulative byte size requested per batched
-                cat_ranges call. Defaults to 256 MiB. This caps one request, not
+                cat_ranges call. Defaults to 512 MiB. This caps one request, not
                 resident memory: the next batch is fetched while the current one is
                 still being decoded and copied, so expect a small multiple of this
                 to be live at peak.
