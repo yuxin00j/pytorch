@@ -428,9 +428,9 @@ class FsspecReader(FileSystemReader):
                 Defaults to 64.
             max_batch_bytes: Maximum cumulative byte size requested per batched
                 cat_ranges call. Defaults to 256 MiB. This caps one request, not
-                resident memory: the next batch is fetched while the current one is
-                still being decoded and copied, so expect a small multiple of this
-                to be live at peak.
+                resident memory: the next two batches are fetched while the current
+                one is still being decoded and copied, so expect a small multiple of
+                this to be live at peak.
             merge_item_bytes: Contiguous items no larger than this are merged
                 into one range, since each range has a fixed cost that dominates
                 for small items. Larger items are read as their own range.
@@ -880,28 +880,35 @@ class FsspecReader(FileSystemReader):
                 received = collections.deque(
                     recv_executor.submit(receive_batch, b) for b in recv_batches
                 )
-                next_io: concurrent.futures.Future | None = None
+                inflight: collections.deque[concurrent.futures.Future] = (
+                    collections.deque()
+                )
+
+                def top_up():
+                    # With one fetch queued behind the running one, the next
+                    # starts as soon as it ends, even while this thread is still
+                    # busy with a large copy.
+                    while jobs and len(inflight) < 2:
+                        inflight.append(prefetch_executor.submit(*jobs.popleft()))
+
                 try:
-                    if jobs:
-                        next_io = prefetch_executor.submit(*jobs.popleft())
-                    while next_io is not None or received:
+                    top_up()
+                    while inflight or received:
                         waiting = [received[0]] if received else []
-                        if next_io is not None:
-                            waiting.append(next_io)
+                        if inflight:
+                            waiting.append(inflight[0])
                         concurrent.futures.wait(
                             waiting, return_when=concurrent.futures.FIRST_COMPLETED
                         )
-                        if next_io is None or not next_io.done():
+                        if not inflight or not inflight[0].done():
                             process(received.popleft().result())
                             continue
-                        items = next_io.result()
-                        next_io = None
+                        items = inflight.popleft().result()
                         if isinstance(items, int):
                             # Another rank took this batch and hands it over.
                             jobs.append((receive_helped, items))
                             items = None
-                        if jobs:
-                            next_io = prefetch_executor.submit(*jobs.popleft())
+                        top_up()
                         if items is not None:
                             process(items)
 
@@ -920,10 +927,10 @@ class FsspecReader(FileSystemReader):
                 finally:
                     # __exit__ calls shutdown(wait=True) without ``cancel_futures``,
                     # so on failure it would drain the queue instead of dropping
-                    # it. Waiting is left to __exit__; the in-flight prefetch is
-                    # cancelled so its result is not silently discarded.
-                    if next_io is not None:
-                        next_io.cancel()
+                    # it. Waiting is left to __exit__; queued prefetches are
+                    # cancelled so their results are not silently discarded.
+                    for f in inflight:
+                        f.cancel()
                     cpu_executor.shutdown(wait=False, cancel_futures=True)
                     recv_executor.shutdown(wait=False, cancel_futures=True)
         finally:
