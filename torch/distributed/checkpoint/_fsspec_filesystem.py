@@ -272,7 +272,9 @@ def _publish(tmp: str, paths: list[str], chunks: list) -> None:
         os.unlink(tmp)
 
 
-def _receive_shared(path: str, length: int, deadline: float) -> mmap.mmap | None:
+def _receive_shared(
+    path: str, length: int, deadline: float, stop: threading.Event
+) -> mmap.mmap | None:
     """Map the file another rank publishes at ``path``, or None to fall back."""
     delay = 0.001
     while True:
@@ -280,7 +282,7 @@ def _receive_shared(path: str, length: int, deadline: float) -> mmap.mmap | None
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             break
         except FileNotFoundError:
-            if time.monotonic() > deadline:
+            if time.monotonic() > deadline or stop.is_set():
                 return None
             time.sleep(delay)
             delay = min(2 * delay, 0.01)
@@ -679,9 +681,9 @@ class FsspecReader(FileSystemReader):
             b = batches[i]
             lengths = [e - s for _, rs, _ in b for s, e in rs]
             name = f"{share.prefix}h{share.rank}.{i}"
-            data = _receive_shared(name, sum(lengths), deadline)
+            data = _receive_shared(name, sum(lengths), deadline, stop)
             if data is None:
-                return fetch_batch(b)
+                return [] if stop.is_set() else fetch_batch(b)
             view = memoryview(data)
             offsets = itertools.accumulate(lengths, initial=0)
             return batch_items(b, [view[o : o + n] for o, n in zip(offsets, lengths)])
@@ -691,13 +693,13 @@ class FsspecReader(FileSystemReader):
             missing = []
             for key, key_reqs in b:
                 path = f"{share.prefix}{share.recv[key]}.{share.rank}"
-                data = _receive_shared(path, key[2], deadline)
+                data = _receive_shared(path, key[2], deadline, stop)
                 if data is None:
                     missing.append((key, key_reqs))
                     continue
                 view = memoryview(data)
                 items.extend((req, [view]) for req in key_reqs)
-            if missing:
+            if missing and not stop.is_set():
                 items += fetch_batch(
                     [
                         (
@@ -780,8 +782,45 @@ class FsspecReader(FileSystemReader):
                 )
             return narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
 
+        def process(items):
+            b_reqs = [req for req, _ in items]
+            decoded = [cpu_executor.submit(decode, req, segs) for req, segs in items]
+            # The futures below own their buffers now; holding the list too
+            # would pin every raw buffer for the whole batch.
+            items.clear()
+
+            # Every planner hook runs on this thread, so planners need not be
+            # thread safe. Only torch.load above and the copies below go to
+            # the pool.
+            pending: list[tuple[ReadItem, Tensor, Tensor]] = []
+            for i, req in enumerate(b_reqs):
+                f = decoded[i]
+                # Drop the future so a completed one stops pinning its decoded
+                # tensor for the rest of the batch.
+                decoded[i] = None
+                item = f.result()
+                if req.type == LoadItemType.BYTE_IO:
+                    planner.load_bytes(req, item)
+                else:
+                    pending.append((req, self._resolve_item(req, item, planner), item))
+
+            if len(pending) > 1 and _destinations_disjoint(
+                [dst for _, dst, _ in pending]
+            ):
+                copies = [cpu_executor.submit(dst.copy_, src) for _, dst, src in pending]
+                for c in copies:
+                    c.result()
+                for req, dst, _ in pending:
+                    planner.commit_tensor(req, dst)
+            else:
+                # Overlapping destinations can mean the planner handed back one
+                # staging buffer, so each item has to be copied and committed
+                # before the next is touched.
+                for req, dst, src in pending:
+                    dst.copy_(src)
+                    planner.commit_tensor(req, dst)
+
         jobs = collections.deque((fetch_own, i) for i in range(len(batches)))
-        jobs.extend((receive_batch, b) for b in recv_batches)
         if not batches:
             own_done.set()
         try:
@@ -790,15 +829,30 @@ class FsspecReader(FileSystemReader):
                     max_workers=self.cpu_workers
                 ) as cpu_executor,
                 concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_executor,
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as recv_executor,
                 concurrent.futures.ThreadPoolExecutor(max_workers=1) as publish_executor,
                 concurrent.futures.ThreadPoolExecutor(max_workers=1) as steal_executor,
             ):
                 helping = steal_executor.submit(steal) if victims else None
+                # Items from other ranks are mapped as they arrive and copied
+                # while this rank's own batches download.
+                received = collections.deque(
+                    recv_executor.submit(receive_batch, b) for b in recv_batches
+                )
                 next_io: concurrent.futures.Future | None = None
                 try:
                     if jobs:
                         next_io = prefetch_executor.submit(*jobs.popleft())
-                    while next_io is not None:
+                    while next_io is not None or received:
+                        waiting = [received[0]] if received else []
+                        if next_io is not None:
+                            waiting.append(next_io)
+                        concurrent.futures.wait(
+                            waiting, return_when=concurrent.futures.FIRST_COMPLETED
+                        )
+                        if next_io is None or not next_io.done():
+                            process(received.popleft().result())
+                            continue
                         items = next_io.result()
                         next_io = None
                         if isinstance(items, int):
@@ -807,52 +861,8 @@ class FsspecReader(FileSystemReader):
                             items = None
                         if jobs:
                             next_io = prefetch_executor.submit(*jobs.popleft())
-                        if items is None:
-                            continue
-
-                        b_reqs = [req for req, _ in items]
-                        decoded = [
-                            cpu_executor.submit(decode, req, segs) for req, segs in items
-                        ]
-                        # The futures below own their buffers now; holding the list
-                        # too would pin every raw buffer for the whole batch.
-                        del items
-
-                        # Every planner hook runs on this thread, so planners need
-                        # not be thread safe. Only torch.load above and the copies
-                        # below go to the pool.
-                        pending: list[tuple[ReadItem, Tensor, Tensor]] = []
-                        for i, req in enumerate(b_reqs):
-                            f = decoded[i]
-                            # Drop the future so a completed one stops pinning its
-                            # decoded tensor for the rest of the batch.
-                            decoded[i] = None
-                            item = f.result()
-                            if req.type == LoadItemType.BYTE_IO:
-                                planner.load_bytes(req, item)
-                            else:
-                                pending.append(
-                                    (req, self._resolve_item(req, item, planner), item)
-                                )
-
-                        if len(pending) > 1 and _destinations_disjoint(
-                            [dst for _, dst, _ in pending]
-                        ):
-                            copies = [
-                                cpu_executor.submit(dst.copy_, src)
-                                for _, dst, src in pending
-                            ]
-                            for c in copies:
-                                c.result()
-                            for req, dst, _ in pending:
-                                planner.commit_tensor(req, dst)
-                        else:
-                            # Overlapping destinations can mean the planner handed
-                            # back one staging buffer, so each item has to be
-                            # copied and committed before the next is touched.
-                            for req, dst, src in pending:
-                                dst.copy_(src)
-                                planner.commit_tensor(req, dst)
+                        if items is not None:
+                            process(items)
 
                     if helping is not None:
                         helping.result()
@@ -874,6 +884,7 @@ class FsspecReader(FileSystemReader):
                     if next_io is not None:
                         next_io.cancel()
                     cpu_executor.shutdown(wait=False, cancel_futures=True)
+                    recv_executor.shutdown(wait=False, cancel_futures=True)
         finally:
             if host:
                 _leave_host(share)
