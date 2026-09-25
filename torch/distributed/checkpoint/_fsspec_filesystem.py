@@ -3,10 +3,16 @@
 
 import bisect
 import concurrent.futures
+import dataclasses
 import io
 import itertools
+import logging
+import mmap
 import os
+import secrets
+import shutil
 import sys
+import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,6 +51,13 @@ __all__ = [
     "FsspecWriter",
     "FsspecReader",
 ]
+
+logger = logging.getLogger(__name__)
+
+_SHM_DIR = "/dev/shm"
+# How long a rank waits for an item another rank fetches for it before
+# fetching the item itself.
+_SHARE_TIMEOUT_S = 600.0
 
 
 class FileSystem(FileSystemBase):
@@ -191,6 +204,80 @@ def _destinations_disjoint(targets: list[Tensor]) -> bool:
     return all(end <= nxt for (_, end), (nxt, _) in itertools.pairwise(spans))
 
 
+def _shm_host_id() -> tuple[str, int] | None:
+    """Identify the /dev/shm this process sees, and its free bytes.
+
+    Ranks reporting the same id can hand each other files through it.
+    """
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            boot_id = f.read().strip()
+        st = os.stat(_SHM_DIR)
+        free = shutil.disk_usage(_SHM_DIR).free
+    except OSError:
+        return None
+    return f"{boot_id}:{st.st_dev}:{st.st_ino}", free
+
+
+_ItemKey = tuple[str, int, int]
+
+
+@dataclasses.dataclass
+class _SharedReads:
+    """Items that several ranks on one host read.
+
+    Each is fetched by one owner, which hands it to the other ranks as hard
+    links of one /dev/shm file named ``{prefix}{id}.{reader rank}``.
+    """
+
+    prefix: str
+    rank: int
+    send: dict[_ItemKey, tuple[int, list[int]]]
+    recv: dict[_ItemKey, int]
+
+
+def _publish_shared(
+    prefix: str, rank: int, name: int, readers: list[int], data: bytes
+) -> None:
+    tmp = f"{prefix}{name}.tmp{rank}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        try:
+            with open(fd, "wb") as f:
+                f.write(data)
+        except OSError:
+            # A short file sends the readers back to storage without waiting.
+            os.truncate(tmp, 0)
+            raise
+        finally:
+            for r in readers:
+                os.link(tmp, f"{prefix}{name}.{r}")
+    finally:
+        os.unlink(tmp)
+
+
+def _receive_shared(path: str, length: int, deadline: float) -> mmap.mmap | None:
+    """Map the file another rank publishes at ``path``, or None to fall back."""
+    delay = 0.001
+    while True:
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            break
+        except FileNotFoundError:
+            if time.monotonic() > deadline:
+                return None
+            time.sleep(delay)
+            delay = min(2 * delay, 0.05)
+    try:
+        if os.fstat(fd).st_size != length:
+            return None
+        flags = mmap.MAP_SHARED | getattr(mmap, "MAP_POPULATE", 0)
+        return mmap.mmap(fd, length, flags=flags, prot=mmap.PROT_READ)
+    finally:
+        os.close(fd)
+        os.unlink(path)
+
+
 class _SegmentReader(io.RawIOBase):
     """Seekable stream over byte segments without joining them.
 
@@ -244,6 +331,7 @@ class FsspecReader(FileSystemReader):
         merge_item_bytes: int = 1024 * 1024,
         range_bytes: int = 16 * 1024 * 1024,
         cpu_workers: int | None = None,
+        share_reads: bool = True,
         **kwargs,
     ) -> None:
         """
@@ -265,6 +353,10 @@ class FsspecReader(FileSystemReader):
             range_bytes: Maximum size of a merged range. Defaults to 16 MiB.
             cpu_workers: Number of worker threads for parallel CPU deserialization.
                 Defaults to min(4, max(1, cpu_count // local_world_size)).
+            share_reads: Fetch items larger than ``merge_item_bytes`` that
+                several ranks on one host read (e.g. tensors replicated across
+                tensor parallel ranks) once, and hand them to the other ranks
+                through /dev/shm. Defaults to True.
             **kwargs: Additional storage options passed to fsspec url_to_fs.
         """
         super().__init__(path)
@@ -277,8 +369,73 @@ class FsspecReader(FileSystemReader):
             total_cpus = os.cpu_count() or 4
             cpu_workers = min(4, max(1, total_cpus // local_world_size))
         self.cpu_workers = max(1, cpu_workers)
+        self.share_reads = share_reads
         self.fs = FileSystem()
         self.path = self.fs.init_path(path, **kwargs)
+
+    def _item_key(self, req: ReadItem) -> _ItemKey:
+        md = self.storage_data[req.storage_index]
+        return md.relative_path, md.offset, md.length
+
+    def prepare_local_plan(self, plan: LoadPlan) -> LoadPlan:
+        plan = super().prepare_local_plan(plan)
+        if self.share_reads and plan.storage_data is None:
+            plan = dataclasses.replace(plan, storage_data=_shm_host_id())
+        return plan
+
+    def prepare_global_plan(self, plans: list[LoadPlan]) -> list[LoadPlan]:
+        plans = super().prepare_global_plan(plans)
+        if not self.share_reads:
+            return plans
+        hosts: dict[str, list[int]] = {}
+        free: dict[str, int] = {}
+        for r, p in enumerate(plans):
+            if isinstance(p.storage_data, tuple):
+                host, host_free = p.storage_data
+                hosts.setdefault(host, []).append(r)
+                free[host] = min(free.get(host, host_free), host_free)
+        prefix = os.path.join(_SHM_DIR, f"torch_dcp_{secrets.token_hex(16)}_")
+        send: list[dict] = [{} for _ in plans]
+        recv: list[dict] = [{} for _ in plans]
+        next_id = 0
+        for host, ranks in hosts.items():
+            if len(ranks) < 2:
+                continue
+            readers: dict[_ItemKey, set[int]] = {}
+            for r in ranks:
+                for req in plans[r].items:
+                    key = self._item_key(req)
+                    if key[2] > self.merge_item_bytes:
+                        readers.setdefault(key, set()).add(r)
+            shared = {k: sorted(v) for k, v in readers.items() if len(v) > 1}
+            # Every shared item sits in /dev/shm until its last reader is done.
+            if not shared or 2 * sum(k[2] for k in shared) > free[host]:
+                continue
+            load = dict.fromkeys(ranks, 0)
+            for r in ranks:
+                for req in plans[r].items:
+                    key = self._item_key(req)
+                    if key not in shared:
+                        load[r] += key[2]
+            for key in sorted(shared, key=lambda k: -k[2]):
+                owner = min(shared[key], key=lambda r: (load[r], r))
+                load[owner] += key[2]
+                others = [r for r in shared[key] if r != owner]
+                send[owner][key] = (next_id, others)
+                for r in others:
+                    recv[r][key] = next_id
+                next_id += 1
+        return [
+            dataclasses.replace(
+                p,
+                storage_data=(
+                    _SharedReads(prefix, r, send[r], recv[r])
+                    if send[r] or recv[r]
+                    else None
+                ),
+            )
+            for r, p in enumerate(plans)
+        ]
 
     def _supports_batched_cat_ranges(self) -> bool:
         if not (self.fs and self.fs.fs and hasattr(self.fs.fs, "cat_ranges")):
@@ -298,13 +455,19 @@ class FsspecReader(FileSystemReader):
         if not plan.items or not self._supports_batched_cat_ranges():
             return super().read_data(plan, planner)
 
-        reqs = sorted(
-            plan.items,
-            key=lambda req: (
-                self.storage_data[req.storage_index].relative_path,
-                self.storage_data[req.storage_index].offset,
-            ),
-        )
+        share = plan.storage_data
+        if not isinstance(share, _SharedReads):
+            share = _SharedReads("", -1, {}, {})
+        recv: dict[_ItemKey, list[ReadItem]] = {}
+        keyed = []
+        for req in plan.items:
+            key = self._item_key(req)
+            if key in share.recv:
+                recv.setdefault(key, []).append(req)
+            else:
+                keyed.append((key not in share.send, key[0], key[1], req))
+        # Items other ranks wait for are fetched first.
+        reqs = [k[-1] for k in sorted(keyed, key=lambda k: k[:3])]
 
         # A group is one range holding one or more contiguous items. Each
         # member maps to (range index, lo, hi) segments of the fetched ranges.
@@ -350,6 +513,26 @@ class FsspecReader(FileSystemReader):
         if batch:
             batches.append(batch)
 
+        recv_batches = []
+        batch = []
+        batch_bytes = 0
+        for key, key_reqs in recv.items():
+            if batch and (
+                len(batch) >= self.max_batch_size
+                or batch_bytes + key[2] > self.max_batch_bytes
+            ):
+                recv_batches.append(batch)
+                batch = []
+                batch_bytes = 0
+            batch.append((key, key_reqs))
+            batch_bytes += key[2]
+        if batch:
+            recv_batches.append(batch)
+
+        published: set[_ItemKey] = set()
+        publishes: list[concurrent.futures.Future] = []
+        deadline = time.monotonic() + _SHARE_TIMEOUT_S
+
         def fetch_batch(b):
             bp = [path for path, ranges, _ in b for _ in ranges]
             bs = [s for _, ranges, _ in b for s, _ in ranges]
@@ -380,6 +563,44 @@ class FsspecReader(FileSystemReader):
                 k += len(ranges)
                 for req, segs in members:
                     items.append((req, [views[i][lo:hi] for i, lo, hi in segs]))
+                key = self._item_key(members[0][0])
+                if key in share.send and key not in published:
+                    published.add(key)
+                    name, readers = share.send[key]
+                    publishes.append(
+                        publish_executor.submit(
+                            _publish_shared,
+                            share.prefix,
+                            share.rank,
+                            name,
+                            readers,
+                            chunks[k - 1],
+                        )
+                    )
+            return items
+
+        def receive_batch(b):
+            items = []
+            missing = []
+            for key, key_reqs in b:
+                path = f"{share.prefix}{share.recv[key]}.{share.rank}"
+                data = _receive_shared(path, key[2], deadline)
+                if data is None:
+                    missing.append((key, key_reqs))
+                    continue
+                view = memoryview(data)
+                items.extend((req, [view]) for req in key_reqs)
+            if missing:
+                items += fetch_batch(
+                    [
+                        (
+                            self.fs.concat_path(self.path, key[0]),
+                            [(key[1], key[1] + key[2])],
+                            [(req, [(0, 0, key[2])]) for req in key_reqs],
+                        )
+                        for key, key_reqs in missing
+                    ]
+                )
             return items
 
         def decode(req, segs):
@@ -408,24 +629,25 @@ class FsspecReader(FileSystemReader):
                 )
             return narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
 
+        jobs = [(fetch_batch, b) for b in batches]
+        jobs += [(receive_batch, b) for b in recv_batches]
         with (
             concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.cpu_workers
             ) as cpu_executor,
             concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_executor,
+            concurrent.futures.ThreadPoolExecutor(max_workers=1) as publish_executor,
         ):
             next_io: concurrent.futures.Future | None = None
             try:
-                next_io = prefetch_executor.submit(fetch_batch, batches[0])
+                next_io = prefetch_executor.submit(*jobs[0])
 
-                for idx in range(len(batches)):
+                for idx in range(len(jobs)):
                     items = next_io.result()
                     next_io = None
 
-                    if idx + 1 < len(batches):
-                        next_io = prefetch_executor.submit(
-                            fetch_batch, batches[idx + 1]
-                        )
+                    if idx + 1 < len(jobs):
+                        next_io = prefetch_executor.submit(*jobs[idx + 1])
 
                     b_reqs = [req for req, _ in items]
                     decoded = [
@@ -470,6 +692,11 @@ class FsspecReader(FileSystemReader):
                         for req, dst, src in pending:
                             dst.copy_(src)
                             planner.commit_tensor(req, dst)
+
+                # Readers fall back to storage for anything not handed over.
+                for f in publishes:
+                    if (e := f.exception()) is not None:
+                        logger.warning("Could not share a read via %s: %s", _SHM_DIR, e)
             finally:
                 # __exit__ calls shutdown(wait=True) without ``cancel_futures``,
                 # so on failure it would drain the queue instead of dropping it.
