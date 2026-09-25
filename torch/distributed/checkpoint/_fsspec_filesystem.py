@@ -60,6 +60,8 @@ _SHM_DIR = "/dev/shm"
 # How long a rank waits for an item another rank fetches for it before
 # fetching the item itself.
 _SHARE_TIMEOUT_S = 600.0
+# Rough speed of handing a batch to another rank through /dev/shm.
+_HANDOVER_BYTES_PER_S = 2e9
 
 
 class FileSystem(FileSystemBase):
@@ -720,6 +722,9 @@ class FsspecReader(FileSystemReader):
             def claimed(r, i):
                 return os.path.exists(f"{share.prefix}c{r}.{i}")
 
+            def started(r, i):
+                return os.stat(f"{share.prefix}c{r}.{i}").st_mtime
+
             while not stop.is_set():
                 # Ranks claim their own batches from the front and helpers take
                 # them from the back, so the unclaimed ones are contiguous.
@@ -733,6 +738,16 @@ class FsspecReader(FileSystemReader):
                     while i >= 0 and not claimed(r, i):
                         left += sizes[r][i]
                         i -= 1
+                    # Batch i is in flight. If it is all that precedes the last
+                    # unclaimed batch, taking that batch only helps when i has
+                    # longer to go than a handover takes. A rank claims each
+                    # batch as the previous one lands, which gives its speed.
+                    if last[r] - i == 1 and i >= 1:
+                        took = started(r, i) - started(r, i - 1)
+                        eta = took * sizes[r][i] / max(1, sizes[r][i - 1])
+                        togo = eta - (time.time() - started(r, i))
+                        if togo < left / _HANDOVER_BYTES_PER_S + 0.02:
+                            continue
                     if left > most:
                         best, most = r, left
                 if best is None:
