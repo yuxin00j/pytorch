@@ -2,6 +2,7 @@
 # mypy: ignore-errors
 
 import bisect
+import collections
 import concurrent.futures
 import dataclasses
 import io
@@ -12,9 +13,10 @@ import os
 import secrets
 import shutil
 import sys
+import threading
 import time
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -224,34 +226,48 @@ _ItemKey = tuple[str, int, int]
 
 @dataclasses.dataclass
 class _SharedReads:
-    """Items that several ranks on one host read.
+    """How the ranks on one host split up their reads.
 
-    Each is fetched by one owner, which hands it to the other ranks as hard
-    links of one /dev/shm file named ``{prefix}{id}.{reader rank}``.
+    An item several of them read is fetched by one owner, which hands it to the
+    others as hard links of one /dev/shm file named ``{prefix}{id}.{reader}``.
+    Each rank also claims its batches in order with exclusive files named
+    ``{prefix}c{rank}.{batch}``. A rank that is out of batches claims the last
+    unclaimed batch of the rank with the most bytes left, fetches it and hands
+    it over as ``{prefix}h{rank}.{batch}``.
     """
 
     prefix: str
     rank: int
     send: dict[_ItemKey, tuple[int, list[int]]]
     recv: dict[_ItemKey, int]
+    # The ranges of every batch of every rank on the host, in fetch order.
+    batches: dict[int, list[list[_ItemKey]]]
+    n_shared: int
 
 
-def _publish_shared(
-    prefix: str, rank: int, name: int, readers: list[int], data: bytes
-) -> None:
-    tmp = f"{prefix}{name}.tmp{rank}"
+def _create_excl(path: str) -> bool:
+    """Create an empty file at ``path``, or return False if one exists."""
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    except FileExistsError:
+        return False
+    return True
+
+
+def _publish(tmp: str, paths: list[str], chunks: list) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         try:
             with open(fd, "wb") as f:
-                f.write(data)
+                for chunk in chunks:
+                    f.write(chunk)
         except OSError:
             # A short file sends the readers back to storage without waiting.
             os.truncate(tmp, 0)
             raise
         finally:
-            for r in readers:
-                os.link(tmp, f"{prefix}{name}.{r}")
+            for path in paths:
+                os.link(tmp, path)
     finally:
         os.unlink(tmp)
 
@@ -267,15 +283,36 @@ def _receive_shared(path: str, length: int, deadline: float) -> mmap.mmap | None
             if time.monotonic() > deadline:
                 return None
             time.sleep(delay)
-            delay = min(2 * delay, 0.05)
+            delay = min(2 * delay, 0.01)
     try:
-        if os.fstat(fd).st_size != length:
+        if length == 0 or os.fstat(fd).st_size != length:
             return None
         flags = mmap.MAP_SHARED | getattr(mmap, "MAP_POPULATE", 0)
         return mmap.mmap(fd, length, flags=flags, prot=mmap.PROT_READ)
     finally:
         os.close(fd)
         os.unlink(path)
+
+
+def _leave_host(share: _SharedReads) -> None:
+    """Mark this rank done with the host's files; the last rank removes them."""
+    p = share.prefix
+    ranks = list(share.batches)
+    try:
+        _create_excl(f"{p}x{share.rank}")
+        if not all(os.path.exists(f"{p}x{r}") for r in ranks):
+            return
+        # Anything still here was handed over after its reader gave up on it.
+        names = [f"{p}{n}.{r}" for n in range(share.n_shared) for r in ranks]
+        for r, table in share.batches.items():
+            for i in range(len(table)):
+                names += [f"{p}c{r}.{i}", f"{p}h{r}.{i}"]
+        names += [f"{p}x{r}" for r in ranks]
+        for name in names:
+            with suppress(FileNotFoundError):
+                os.unlink(name)
+    except OSError as e:
+        logger.warning("Could not clean up %s*: %s", p, e)
 
 
 class _SegmentReader(io.RawIOBase):
@@ -353,10 +390,12 @@ class FsspecReader(FileSystemReader):
             range_bytes: Maximum size of a merged range. Defaults to 16 MiB.
             cpu_workers: Number of worker threads for parallel CPU deserialization.
                 Defaults to min(4, max(1, cpu_count // local_world_size)).
-            share_reads: Fetch items larger than ``merge_item_bytes`` that
-                several ranks on one host read (e.g. tensors replicated across
-                tensor parallel ranks) once, and hand them to the other ranks
-                through /dev/shm. Defaults to True.
+            share_reads: Let the ranks on one host share their reads through
+                /dev/shm. Items larger than ``merge_item_bytes`` that several of
+                them read (e.g. tensors replicated across tensor parallel ranks)
+                are fetched once, and a rank that finishes its own batches early
+                fetches the last batches of slower ranks for them. Defaults to
+                True.
             **kwargs: Additional storage options passed to fsspec url_to_fs.
         """
         super().__init__(path)
@@ -385,18 +424,18 @@ class FsspecReader(FileSystemReader):
 
     def prepare_global_plan(self, plans: list[LoadPlan]) -> list[LoadPlan]:
         plans = super().prepare_global_plan(plans)
-        if not self.share_reads:
+        if not self.share_reads or not self._supports_batched_cat_ranges():
             return plans
         hosts: dict[str, list[int]] = {}
         free: dict[str, int] = {}
         for r, p in enumerate(plans):
-            if isinstance(p.storage_data, tuple):
+            # read_data returns early on an empty plan, so it takes no part.
+            if isinstance(p.storage_data, tuple) and p.items:
                 host, host_free = p.storage_data
                 hosts.setdefault(host, []).append(r)
                 free[host] = min(free.get(host, host_free), host_free)
         prefix = os.path.join(_SHM_DIR, f"torch_dcp_{secrets.token_hex(16)}_")
-        send: list[dict] = [{} for _ in plans]
-        recv: list[dict] = [{} for _ in plans]
+        shares: list[_SharedReads | None] = [None] * len(plans)
         next_id = 0
         for host, ranks in hosts.items():
             if len(ranks) < 2:
@@ -408,9 +447,12 @@ class FsspecReader(FileSystemReader):
                     if key[2] > self.merge_item_bytes:
                         readers.setdefault(key, set()).add(r)
             shared = {k: sorted(v) for k, v in readers.items() if len(v) > 1}
+            shared_bytes = sum(k[2] for k in shared)
             # Every shared item sits in /dev/shm until its last reader is done.
-            if not shared or 2 * sum(k[2] for k in shared) > free[host]:
-                continue
+            if 2 * shared_bytes > free[host]:
+                shared, shared_bytes = {}, 0
+            send: dict[int, dict] = {r: {} for r in ranks}
+            recv: dict[int, dict] = {r: {} for r in ranks}
             load = dict.fromkeys(ranks, 0)
             for r in ranks:
                 for req in plans[r].items:
@@ -425,57 +467,50 @@ class FsspecReader(FileSystemReader):
                 for r in others:
                     recv[r][key] = next_id
                 next_id += 1
-        return [
-            dataclasses.replace(
-                p,
-                storage_data=(
-                    _SharedReads(prefix, r, send[r], recv[r])
-                    if send[r] or recv[r]
-                    else None
-                ),
+            tables = {}
+            for r in ranks:
+                batches, _ = self._batches(plans[r].items, send[r], recv[r])
+                tables[r] = self._batch_table(batches)
+            # So does a batch fetched for another rank, until that rank maps it.
+            biggest = max(
+                (sum(n for *_, n in b) for t in tables.values() for b in t), default=0
             )
-            for r, p in enumerate(plans)
-        ]
+            if 2 * (shared_bytes + len(ranks) * biggest) > free[host]:
+                tables = dict.fromkeys(ranks, [])
+            for r in ranks:
+                shares[r] = _SharedReads(prefix, r, send[r], recv[r], tables, next_id)
+        return [dataclasses.replace(p, storage_data=s) for p, s in zip(plans, shares)]
 
-    def _supports_batched_cat_ranges(self) -> bool:
-        if not (self.fs and self.fs.fs and hasattr(self.fs.fs, "cat_ranges")):
-            return False
-        # AsyncFileSystem subclasses (gcsfs, s3fs) bind the sync cat_ranges onto
-        # the instance via mirror_sync_methods, so it is not on the class.
-        if isinstance(self.fs.fs, fsspec.asyn.AsyncFileSystem):
-            return True
-        # The AbstractFileSystem fallback reopens the file per range, which is
-        # slower than the single stream per shard in FileSystemReader.read_data.
-        cat_ranges_fn = getattr(
-            self.fs.fs.cat_ranges, "__func__", self.fs.fs.cat_ranges
-        )
-        return cat_ranges_fn is not fsspec.AbstractFileSystem.cat_ranges
+    def _batches(
+        self,
+        items: list[ReadItem],
+        send: dict[_ItemKey, tuple[int, list[int]]],
+        recv_keys: dict[_ItemKey, int],
+    ) -> tuple[list, dict[_ItemKey, list[ReadItem]]]:
+        """Split items into the cat_ranges batches read_data fetches, in order.
 
-    def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
-        if not plan.items or not self._supports_batched_cat_ranges():
-            return super().read_data(plan, planner)
-
-        share = plan.storage_data
-        if not isinstance(share, _SharedReads):
-            share = _SharedReads("", -1, {}, {})
+        A batch is a list of groups, and a group is one range holding one or
+        more contiguous items: ``(relative_path, [(start, end)], members)``,
+        where each member maps to (range index, lo, hi) segments of the fetched
+        ranges. Items in ``recv_keys`` come from another rank and are returned
+        apart, by key.
+        """
         recv: dict[_ItemKey, list[ReadItem]] = {}
         keyed = []
-        for req in plan.items:
+        for req in items:
             key = self._item_key(req)
-            if key in share.recv:
+            if key in recv_keys:
                 recv.setdefault(key, []).append(req)
             else:
-                keyed.append((key not in share.send, key[0], key[1], req))
+                keyed.append((key not in send, key[0], key[1], req))
         # Items other ranks wait for are fetched first.
         reqs = [k[-1] for k in sorted(keyed, key=lambda k: k[:3])]
 
-        # A group is one range holding one or more contiguous items. Each
-        # member maps to (range index, lo, hi) segments of the fetched ranges.
         groups = []
         span = None
         for req in reqs:
             item_md = self.storage_data[req.storage_index]
-            path = self.fs.concat_path(self.path, item_md.relative_path)
+            path = item_md.relative_path
             start, end = item_md.offset, item_md.offset + item_md.length
             if item_md.length > self.merge_item_bytes:
                 span = None
@@ -512,6 +547,49 @@ class FsspecReader(FileSystemReader):
             batch_bytes += g_bytes
         if batch:
             batches.append(batch)
+        return batches, recv
+
+    @staticmethod
+    def _batch_table(batches: list) -> list[list[_ItemKey]]:
+        return [[(p, s, e - s) for p, rs, _ in b for s, e in rs] for b in batches]
+
+    def _supports_batched_cat_ranges(self) -> bool:
+        if not (self.fs and self.fs.fs and hasattr(self.fs.fs, "cat_ranges")):
+            return False
+        # AsyncFileSystem subclasses (gcsfs, s3fs) bind the sync cat_ranges onto
+        # the instance via mirror_sync_methods, so it is not on the class.
+        if isinstance(self.fs.fs, fsspec.asyn.AsyncFileSystem):
+            return True
+        # The AbstractFileSystem fallback reopens the file per range, which is
+        # slower than the single stream per shard in FileSystemReader.read_data.
+        cat_ranges_fn = getattr(
+            self.fs.fs.cat_ranges, "__func__", self.fs.fs.cat_ranges
+        )
+        return cat_ranges_fn is not fsspec.AbstractFileSystem.cat_ranges
+
+    def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
+        share = plan.storage_data
+        if not isinstance(share, _SharedReads):
+            share = _SharedReads("", -1, {}, {}, {}, 0)
+        host = share.batches
+        batches = None
+        recv: dict[_ItemKey, list[ReadItem]] = {}
+        if plan.items and self._supports_batched_cat_ranges():
+            batches, recv = self._batches(plan.items, share.send, share.recv)
+        mine = host.get(share.rank, [])
+        claims = batches is not None and mine == self._batch_table(batches)
+        if host and not claims:
+            # Keep the other ranks from taking batches this rank will not map,
+            # e.g. because finish_plan changed its reads after the coordinator
+            # split them up.
+            for i in range(len(mine)):
+                with suppress(OSError):
+                    _create_excl(f"{share.prefix}c{share.rank}.{i}")
+        if batches is None:
+            if host:
+                _leave_host(share)
+            return super().read_data(plan, planner)
+        victims = {r: t for r, t in host.items() if r != share.rank and t}
 
         recv_batches = []
         batch = []
@@ -532,22 +610,24 @@ class FsspecReader(FileSystemReader):
         published: set[_ItemKey] = set()
         publishes: list[concurrent.futures.Future] = []
         deadline = time.monotonic() + _SHARE_TIMEOUT_S
+        own_done = threading.Event()
+        stop = threading.Event()
 
-        def fetch_batch(b):
-            bp = [path for path, ranges, _ in b for _ in ranges]
-            bs = [s for _, ranges, _ in b for s, _ in ranges]
-            be = [e for _, ranges, _ in b for _, e in ranges]
-            chunks = self.fs.fs.cat_ranges(bp, bs, be, on_error="raise")
+        def fetch_ranges(ranges):
+            paths = [self.fs.concat_path(self.path, rel) for rel, _, _ in ranges]
+            starts = [s for _, s, _ in ranges]
+            ends = [e for _, _, e in ranges]
+            chunks = self.fs.fs.cat_ranges(paths, starts, ends, on_error="raise")
             # A short list means some ranges were dropped (``on_error="omit"``).
             # Left unchecked, items would silently be skipped and leave their
             # tensors at whatever the caller initialized them to.
-            if len(chunks) != len(bp):
+            if len(chunks) != len(paths):
                 raise RuntimeError(
-                    f"cat_ranges returned {len(chunks)} chunks for {len(bp)} ranges"
+                    f"cat_ranges returned {len(chunks)} chunks for {len(paths)} ranges"
                 )
             # ``on_error`` is advisory: fsspec honors it only since 2026.7.0 and
             # other backends may ignore it, returning exceptions in-band.
-            for path, start, end, chunk in zip(bp, bs, be, chunks):
+            for path, start, end, chunk in zip(paths, starts, ends, chunks):
                 if isinstance(chunk, BaseException):
                     raise RuntimeError(
                         f"Failed to read bytes [{start}, {end}) from {path}"
@@ -556,6 +636,9 @@ class FsspecReader(FileSystemReader):
                     raise RuntimeError(
                         f"Read {len(chunk)} bytes for [{start}, {end}) from {path}"
                     )
+            return chunks
+
+        def batch_items(b, chunks):
             items = []
             k = 0
             for _, ranges, members in b:
@@ -569,15 +652,39 @@ class FsspecReader(FileSystemReader):
                     name, readers = share.send[key]
                     publishes.append(
                         publish_executor.submit(
-                            _publish_shared,
-                            share.prefix,
-                            share.rank,
-                            name,
-                            readers,
-                            chunks[k - 1],
+                            _publish,
+                            f"{share.prefix}{name}.tmp{share.rank}",
+                            [f"{share.prefix}{name}.{r}" for r in readers],
+                            [chunks[k - 1]],
                         )
                     )
             return items
+
+        def fetch_batch(b):
+            ranges = [(rel, s, e) for rel, rs, _ in b for s, e in rs]
+            return batch_items(b, fetch_ranges(ranges))
+
+        def fetch_own(i):
+            try:
+                # A rank that cannot create its claim file reads the batch anyway.
+                with suppress(OSError):
+                    if claims and not _create_excl(f"{share.prefix}c{share.rank}.{i}"):
+                        return i
+                return fetch_batch(batches[i])
+            finally:
+                if i == len(batches) - 1:
+                    own_done.set()
+
+        def receive_helped(i):
+            b = batches[i]
+            lengths = [e - s for _, rs, _ in b for s, e in rs]
+            name = f"{share.prefix}h{share.rank}.{i}"
+            data = _receive_shared(name, sum(lengths), deadline)
+            if data is None:
+                return fetch_batch(b)
+            view = memoryview(data)
+            offsets = itertools.accumulate(lengths, initial=0)
+            return batch_items(b, [view[o : o + n] for o, n in zip(offsets, lengths)])
 
         def receive_batch(b):
             items = []
@@ -594,7 +701,7 @@ class FsspecReader(FileSystemReader):
                 items += fetch_batch(
                     [
                         (
-                            self.fs.concat_path(self.path, key[0]),
+                            key[0],
                             [(key[1], key[1] + key[2])],
                             [(req, [(0, 0, key[2])]) for req in key_reqs],
                         )
@@ -602,6 +709,50 @@ class FsspecReader(FileSystemReader):
                     ]
                 )
             return items
+
+        def steal():
+            own_done.wait()
+            last = {r: len(t) - 1 for r, t in victims.items()}
+            sizes = {r: [sum(n for *_, n in b) for b in t] for r, t in victims.items()}
+
+            def claimed(r, i):
+                return os.path.exists(f"{share.prefix}c{r}.{i}")
+
+            while not stop.is_set():
+                # Ranks claim their own batches from the front and helpers take
+                # them from the back, so the unclaimed ones are contiguous.
+                best, most = None, 0
+                for r in victims:
+                    i = last[r]
+                    while i >= 0 and claimed(r, i):
+                        i -= 1
+                    last[r] = i
+                    left = 0
+                    while i >= 0 and not claimed(r, i):
+                        left += sizes[r][i]
+                        i -= 1
+                    if left > most:
+                        best, most = r, left
+                if best is None:
+                    return
+                i = last[best]
+                try:
+                    if not _create_excl(f"{share.prefix}c{best}.{i}"):
+                        continue
+                except OSError:
+                    return
+                name = f"{share.prefix}h{best}.{i}"
+                try:
+                    chunks = fetch_ranges(
+                        [(rel, s, s + n) for rel, s, n in victims[best][i]]
+                    )
+                except Exception as e:
+                    # An empty file sends that rank back to storage.
+                    logger.warning("Could not read a batch for rank %d: %s", best, e)
+                    chunks = []
+                publishes.append(
+                    publish_executor.submit(_publish, f"{name}.tmp", [name], chunks)
+                )
 
         def decode(req, segs):
             item_md = self.storage_data[req.storage_index]
@@ -629,82 +780,103 @@ class FsspecReader(FileSystemReader):
                 )
             return narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
 
-        jobs = [(fetch_batch, b) for b in batches]
-        jobs += [(receive_batch, b) for b in recv_batches]
-        with (
-            concurrent.futures.ThreadPoolExecutor(
-                max_workers=self.cpu_workers
-            ) as cpu_executor,
-            concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_executor,
-            concurrent.futures.ThreadPoolExecutor(max_workers=1) as publish_executor,
-        ):
-            next_io: concurrent.futures.Future | None = None
-            try:
-                next_io = prefetch_executor.submit(*jobs[0])
+        jobs = collections.deque((fetch_own, i) for i in range(len(batches)))
+        jobs.extend((receive_batch, b) for b in recv_batches)
+        if not batches:
+            own_done.set()
+        try:
+            with (
+                concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.cpu_workers
+                ) as cpu_executor,
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_executor,
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as publish_executor,
+                concurrent.futures.ThreadPoolExecutor(max_workers=1) as steal_executor,
+            ):
+                helping = steal_executor.submit(steal) if victims else None
+                next_io: concurrent.futures.Future | None = None
+                try:
+                    if jobs:
+                        next_io = prefetch_executor.submit(*jobs.popleft())
+                    while next_io is not None:
+                        items = next_io.result()
+                        next_io = None
+                        if isinstance(items, int):
+                            # Another rank took this batch and hands it over.
+                            jobs.append((receive_helped, items))
+                            items = None
+                        if jobs:
+                            next_io = prefetch_executor.submit(*jobs.popleft())
+                        if items is None:
+                            continue
 
-                for idx in range(len(jobs)):
-                    items = next_io.result()
-                    next_io = None
-
-                    if idx + 1 < len(jobs):
-                        next_io = prefetch_executor.submit(*jobs[idx + 1])
-
-                    b_reqs = [req for req, _ in items]
-                    decoded = [
-                        cpu_executor.submit(decode, req, segs) for req, segs in items
-                    ]
-                    # The futures below own their buffers now; holding the list
-                    # too would pin every raw buffer for the whole batch.
-                    del items
-
-                    # Every planner hook runs on this thread, so planners need
-                    # not be thread safe. Only torch.load above and the copies
-                    # below go to the pool.
-                    pending: list[tuple[ReadItem, Tensor, Tensor]] = []
-                    for i, req in enumerate(b_reqs):
-                        f = decoded[i]
-                        # Drop the future so a completed one stops pinning its
-                        # decoded tensor for the rest of the batch.
-                        decoded[i] = None
-                        item = f.result()
-                        if req.type == LoadItemType.BYTE_IO:
-                            planner.load_bytes(req, item)
-                        else:
-                            pending.append(
-                                (req, self._resolve_item(req, item, planner), item)
-                            )
-
-                    if len(pending) > 1 and _destinations_disjoint(
-                        [dst for _, dst, _ in pending]
-                    ):
-                        copies = [
-                            cpu_executor.submit(dst.copy_, src)
-                            for _, dst, src in pending
+                        b_reqs = [req for req, _ in items]
+                        decoded = [
+                            cpu_executor.submit(decode, req, segs) for req, segs in items
                         ]
-                        for c in copies:
-                            c.result()
-                        for req, dst, _ in pending:
-                            planner.commit_tensor(req, dst)
-                    else:
-                        # Overlapping destinations can mean the planner handed
-                        # back one staging buffer, so each item has to be
-                        # copied and committed before the next is touched.
-                        for req, dst, src in pending:
-                            dst.copy_(src)
-                            planner.commit_tensor(req, dst)
+                        # The futures below own their buffers now; holding the list
+                        # too would pin every raw buffer for the whole batch.
+                        del items
 
-                # Readers fall back to storage for anything not handed over.
-                for f in publishes:
-                    if (e := f.exception()) is not None:
-                        logger.warning("Could not share a read via %s: %s", _SHM_DIR, e)
-            finally:
-                # __exit__ calls shutdown(wait=True) without ``cancel_futures``,
-                # so on failure it would drain the queue instead of dropping it.
-                # Waiting is left to __exit__; the in-flight prefetch is
-                # cancelled so its result is not silently discarded.
-                if next_io is not None:
-                    next_io.cancel()
-                cpu_executor.shutdown(wait=False, cancel_futures=True)
+                        # Every planner hook runs on this thread, so planners need
+                        # not be thread safe. Only torch.load above and the copies
+                        # below go to the pool.
+                        pending: list[tuple[ReadItem, Tensor, Tensor]] = []
+                        for i, req in enumerate(b_reqs):
+                            f = decoded[i]
+                            # Drop the future so a completed one stops pinning its
+                            # decoded tensor for the rest of the batch.
+                            decoded[i] = None
+                            item = f.result()
+                            if req.type == LoadItemType.BYTE_IO:
+                                planner.load_bytes(req, item)
+                            else:
+                                pending.append(
+                                    (req, self._resolve_item(req, item, planner), item)
+                                )
+
+                        if len(pending) > 1 and _destinations_disjoint(
+                            [dst for _, dst, _ in pending]
+                        ):
+                            copies = [
+                                cpu_executor.submit(dst.copy_, src)
+                                for _, dst, src in pending
+                            ]
+                            for c in copies:
+                                c.result()
+                            for req, dst, _ in pending:
+                                planner.commit_tensor(req, dst)
+                        else:
+                            # Overlapping destinations can mean the planner handed
+                            # back one staging buffer, so each item has to be
+                            # copied and committed before the next is touched.
+                            for req, dst, src in pending:
+                                dst.copy_(src)
+                                planner.commit_tensor(req, dst)
+
+                    if helping is not None:
+                        helping.result()
+                    # Readers fall back to storage for anything not handed over.
+                    for f in publishes:
+                        if (e := f.exception()) is not None:
+                            logger.warning(
+                                "Could not share a read via %s: %s", _SHM_DIR, e
+                            )
+                except BaseException:
+                    stop.set()
+                    own_done.set()
+                    raise
+                finally:
+                    # __exit__ calls shutdown(wait=True) without ``cancel_futures``,
+                    # so on failure it would drain the queue instead of dropping
+                    # it. Waiting is left to __exit__; the in-flight prefetch is
+                    # cancelled so its result is not silently discarded.
+                    if next_io is not None:
+                        next_io.cancel()
+                    cpu_executor.shutdown(wait=False, cancel_futures=True)
+        finally:
+            if host:
+                _leave_host(share)
 
         fut: Future[None] = Future()
         fut.set_result(None)
