@@ -360,6 +360,52 @@ class _SegmentReader(io.RawIOBase):
         return n
 
 
+def _load_aliased(buf: memoryview, layouts: dict[tuple[bytes, int], tuple]) -> Tensor:
+    """torch.load one DCP tensor record, aliasing ``buf`` if the byte order matches.
+
+    Tensors with the same dtype, shape and stride have byte-identical pickles, so
+    ``layouts`` lets the weights_only unpickler run once per layout instead of
+    once per tensor. It holds the GIL for ~0.3 ms per call, and the event loop
+    fetching the next batch waits for it.
+    """
+    with _open_zipfile_reader(_SegmentReader([buf])) as zf:
+        if not (
+            zf.has_record("byteorder")
+            and zf.get_record("byteorder") == sys.byteorder.encode()
+        ):
+            return _load(zf, "cpu", _weights_only_unpickler, encoding="utf-8")
+        key = None
+        if zf.has_record("data/0"):
+            start = zf.get_record_offset("data/0")
+            key = (zf.get_record("data.pkl"), zf.get_record_size("data/0"))
+            if (layout := layouts.get(key)) is not None:
+                dtype, size, stride, offset = layout
+                count = key[1] // dtype.itemsize
+                data = torch.frombuffer(buf, dtype=dtype, count=count, offset=start)
+                return data.as_strided(size, stride, offset)
+        storage = torch.frombuffer(buf, dtype=torch.uint8).untyped_storage()
+        tensor = _load(
+            zf,
+            "cpu",
+            _weights_only_unpickler,
+            overall_storage=storage,
+            encoding="utf-8",
+        )
+    if (
+        key is not None
+        and key[1] > 0
+        and type(tensor) is torch.Tensor
+        and tensor.layout == torch.strided
+        and not (tensor.requires_grad or tensor.is_conj() or tensor.is_neg())
+        and not tensor.is_quantized
+        and tensor.untyped_storage().data_ptr() == storage.data_ptr() + start
+        and tensor.untyped_storage().nbytes() == key[1]
+    ):
+        layout = (tensor.dtype, tensor.shape, tensor.stride(), tensor.storage_offset())
+        layouts[key] = layout
+    return tensor
+
+
 class FsspecReader(FileSystemReader):
     def __init__(
         self,
@@ -756,6 +802,8 @@ class FsspecReader(FileSystemReader):
                     publish_executor.submit(_publish, f"{name}.tmp", [name], chunks)
                 )
 
+        layouts: dict[tuple[bytes, int], tuple] = {}
+
         def decode(req, segs):
             item_md = self.storage_data[req.storage_index]
             if (
@@ -766,20 +814,7 @@ class FsspecReader(FileSystemReader):
                 return self._decode_item(req, _SegmentReader(segs))
             # Storages alias the fetched bytes rather than being copied out of
             # them under the GIL, so ``dst.copy_`` reads the network buffer.
-            with _open_zipfile_reader(_SegmentReader(segs)) as zf:
-                storage = None
-                if zf.has_record("byteorder") and zf.get_record("byteorder") == (
-                    sys.byteorder.encode()
-                ):
-                    storage = torch.frombuffer(segs[0], dtype=torch.uint8)
-                    storage = storage.untyped_storage()
-                tensor = _load(
-                    zf,
-                    "cpu",
-                    _weights_only_unpickler,
-                    overall_storage=storage,
-                    encoding="utf-8",
-                )
+            tensor = _load_aliased(segs[0], layouts)
             return narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
 
         def process(items):
