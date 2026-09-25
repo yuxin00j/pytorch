@@ -817,16 +817,22 @@ class FsspecReader(FileSystemReader):
                 # staging buffer, so each item has to be copied and committed
                 # before the next is touched.
                 for req, dst, src in pending:
-                    dst.copy_(src)
+                    cpu_executor.submit(dst.copy_, src).result()
                     planner.commit_tensor(req, dst)
 
         jobs = collections.deque((fetch_own, i) for i in range(len(batches)))
         if not batches:
             own_done.set()
+        intra_op_threads = torch.get_num_threads()
         try:
             with (
                 concurrent.futures.ThreadPoolExecutor(
-                    max_workers=self.cpu_workers
+                    max_workers=self.cpu_workers,
+                    # Copies already run in parallel on these threads. Giving
+                    # each one a full intra-op pool as well oversubscribes a host
+                    # shared by several ranks and slows their downloads.
+                    initializer=torch.set_num_threads,
+                    initargs=(1,),
                 ) as cpu_executor,
                 concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_executor,
                 concurrent.futures.ThreadPoolExecutor(max_workers=1) as recv_executor,
@@ -888,6 +894,9 @@ class FsspecReader(FileSystemReader):
         finally:
             if host:
                 _leave_host(share)
+            # The pool's set_num_threads also changed the default for threads
+            # that have not run an op yet.
+            torch.set_num_threads(intra_op_threads)
 
         fut: Future[None] = Future()
         fut.set_result(None)
