@@ -1,6 +1,7 @@
 # Mypy will not try inferring the types of any 3rd party libraries installed.
 # mypy: ignore-errors
 
+import bisect
 import concurrent.futures
 import io
 import itertools
@@ -185,6 +186,49 @@ def _destinations_disjoint(targets: list[Tensor]) -> bool:
     return all(end <= nxt for (_, end), (nxt, _) in itertools.pairwise(spans))
 
 
+class _SegmentReader(io.RawIOBase):
+    """Seekable stream over byte segments without joining them.
+
+    ``torch.load`` reads through ``readinto``, so the bytes are copied once,
+    straight from the fetched buffers into tensor storage.
+    """
+
+    def __init__(self, segments: list[memoryview]) -> None:
+        super().__init__()
+        self._segs = segments
+        self._starts = list(itertools.accumulate(map(len, segments), initial=0))
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, pos: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_CUR:
+            pos += self._pos
+        elif whence == io.SEEK_END:
+            pos += self._starts[-1]
+        self._pos = pos
+        return pos
+
+    def readinto(self, b) -> int:
+        out = memoryview(b).cast("B")
+        n = 0
+        while n < len(out) and self._pos < self._starts[-1]:
+            i = bisect.bisect_right(self._starts, self._pos) - 1
+            off = self._pos - self._starts[i]
+            k = min(len(out) - n, len(self._segs[i]) - off)
+            out[n : n + k] = self._segs[i][off : off + k]
+            n += k
+            self._pos += k
+        return n
+
+
 class FsspecReader(FileSystemReader):
     def __init__(
         self,
@@ -192,6 +236,8 @@ class FsspecReader(FileSystemReader):
         *,
         max_batch_size: int = 64,
         max_batch_bytes: int = 256 * 1024 * 1024,
+        merge_item_bytes: int = 1024 * 1024,
+        range_bytes: int = 16 * 1024 * 1024,
         cpu_workers: int | None = None,
         **kwargs,
     ) -> None:
@@ -200,13 +246,18 @@ class FsspecReader(FileSystemReader):
 
         Args:
             path: directory or URL where the checkpoint will be read from.
-            max_batch_size: Maximum number of read items per batched cat_ranges call.
+            max_batch_size: Maximum number of ranges per batched cat_ranges call.
                 Defaults to 64.
             max_batch_bytes: Maximum cumulative byte size requested per batched
                 cat_ranges call. Defaults to 256 MiB. This caps one request, not
                 resident memory: the next batch is fetched while the current one is
                 still being decoded and copied, so expect a small multiple of this
                 to be live at peak.
+            merge_item_bytes: Contiguous items no larger than this are merged
+                into one range, since each range has a fixed cost that dominates
+                for small items. Larger items are read as their own range.
+                Defaults to 1 MiB.
+            range_bytes: Maximum size of a merged range. Defaults to 16 MiB.
             cpu_workers: Number of worker threads for parallel CPU deserialization.
                 Defaults to min(4, max(1, cpu_count // local_world_size)).
             **kwargs: Additional storage options passed to fsspec url_to_fs.
@@ -214,6 +265,8 @@ class FsspecReader(FileSystemReader):
         super().__init__(path)
         self.max_batch_size = max(1, max_batch_size)
         self.max_batch_bytes = max(1, max_batch_bytes)
+        self.merge_item_bytes = merge_item_bytes
+        self.range_bytes = max(1, range_bytes)
         if cpu_workers is None:
             local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", 1)))
             total_cpus = os.cpu_count() or 4
@@ -248,58 +301,84 @@ class FsspecReader(FileSystemReader):
             ),
         )
 
-        batches = []
-        batch = []
-        paths = []
-        starts = []
-        ends = []
-        batch_bytes = 0
-
+        # A group is one range holding one or more contiguous items. Each
+        # member maps to (range index, lo, hi) segments of the fetched ranges.
+        groups = []
+        span = None
         for req in reqs:
             item_md = self.storage_data[req.storage_index]
-            if batch and (
-                len(batch) >= self.max_batch_size
-                or batch_bytes + item_md.length > self.max_batch_bytes
+            path = self.fs.concat_path(self.path, item_md.relative_path)
+            start, end = item_md.offset, item_md.offset + item_md.length
+            if item_md.length > self.merge_item_bytes:
+                span = None
+                groups.append((path, [(start, end)], [(req, [(0, 0, end - start)])]))
+            elif (
+                span is not None
+                and span[0] == path
+                and span[1][0][1] == start
+                and end - span[1][0][0] <= self.range_bytes
             ):
-                batches.append((paths, starts, ends, batch))
-                batch = []
-                paths = []
-                starts = []
-                ends = []
-                batch_bytes = 0
-            batch.append(req)
-            paths.append(self.fs.concat_path(self.path, item_md.relative_path))
-            starts.append(item_md.offset)
-            ends.append(item_md.offset + item_md.length)
-            batch_bytes += item_md.length
+                s0 = span[1][0][0]
+                span[1][0] = (s0, end)
+                span[2].append((req, [(0, start - s0, end - s0)]))
+            else:
+                span = (path, [(start, end)], [(req, [(0, 0, end - start)])])
+                groups.append(span)
 
+        batches = []
+        batch = []
+        n_ranges = 0
+        batch_bytes = 0
+        for g in groups:
+            g_bytes = sum(e - s for s, e in g[1])
+            if batch and (
+                n_ranges + len(g[1]) > self.max_batch_size
+                or batch_bytes + g_bytes > self.max_batch_bytes
+            ):
+                batches.append(batch)
+                batch = []
+                n_ranges = 0
+                batch_bytes = 0
+            batch.append(g)
+            n_ranges += len(g[1])
+            batch_bytes += g_bytes
         if batch:
-            batches.append((paths, starts, ends, batch))
+            batches.append(batch)
 
         def fetch_batch(b):
-            bp, bs, be, br = b
+            bp = [path for path, ranges, _ in b for _ in ranges]
+            bs = [s for _, ranges, _ in b for s, _ in ranges]
+            be = [e for _, ranges, _ in b for _, e in ranges]
             chunks = self.fs.fs.cat_ranges(bp, bs, be, on_error="raise")
             # A short list means some ranges were dropped (``on_error="omit"``).
-            # Left unchecked, the zip below would silently skip those items and
-            # leave their tensors at whatever the caller initialized them to.
-            if len(chunks) != len(br):
+            # Left unchecked, items would silently be skipped and leave their
+            # tensors at whatever the caller initialized them to.
+            if len(chunks) != len(bp):
                 raise RuntimeError(
-                    f"cat_ranges returned {len(chunks)} chunks for {len(br)} ranges"
+                    f"cat_ranges returned {len(chunks)} chunks for {len(bp)} ranges"
                 )
             # ``on_error`` is advisory: fsspec honors it only since 2026.7.0 and
             # other backends may ignore it, returning exceptions in-band.
-            # Unchecked, they reach ``io.BytesIO`` as an opaque TypeError.
             for path, start, end, chunk in zip(bp, bs, be, chunks):
                 if isinstance(chunk, BaseException):
                     raise RuntimeError(
                         f"Failed to read bytes [{start}, {end}) from {path}"
                     ) from chunk
-            return chunks, br
+                if len(chunk) != end - start:
+                    raise RuntimeError(
+                        f"Read {len(chunk)} bytes for [{start}, {end}) from {path}"
+                    )
+            items = []
+            k = 0
+            for _, ranges, members in b:
+                views = [memoryview(c) for c in chunks[k : k + len(ranges)]]
+                k += len(ranges)
+                for req, segs in members:
+                    items.append((req, [views[i][lo:hi] for i, lo, hi in segs]))
+            return items
 
-        def decode(req, chunk_data):
-            # Wrapping here rather than at submit time keeps the buffer copy
-            # off the calling thread.
-            return self._decode_item(req, io.BytesIO(chunk_data))
+        def decode(req, segs):
+            return self._decode_item(req, _SegmentReader(segs))
 
         with (
             concurrent.futures.ThreadPoolExecutor(
@@ -312,7 +391,7 @@ class FsspecReader(FileSystemReader):
                 next_io = prefetch_executor.submit(fetch_batch, batches[0])
 
                 for idx in range(len(batches)):
-                    chunks, b_reqs = next_io.result()
+                    items = next_io.result()
                     next_io = None
 
                     if idx + 1 < len(batches):
@@ -320,13 +399,13 @@ class FsspecReader(FileSystemReader):
                             fetch_batch, batches[idx + 1]
                         )
 
+                    b_reqs = [req for req, _ in items]
                     decoded = [
-                        cpu_executor.submit(decode, req, chunk_data)
-                        for req, chunk_data in zip(b_reqs, chunks)
+                        cpu_executor.submit(decode, req, segs) for req, segs in items
                     ]
-                    # The futures below own their chunk now; holding the list
+                    # The futures below own their buffers now; holding the list
                     # too would pin every raw buffer for the whole batch.
-                    del chunks
+                    del items
 
                     # Every planner hook runs on this thread, so planners need
                     # not be thread safe. Only torch.load above and the copies
