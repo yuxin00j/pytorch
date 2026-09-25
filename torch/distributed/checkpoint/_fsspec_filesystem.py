@@ -65,6 +65,8 @@ _SHARE_TIMEOUT_S = 600.0
 # /dev/shm, and the owner polling for and mapping it.
 _HANDOVER_S = 0.1
 _HANDOVER_BYTES_PER_S = 2e9
+# At most this many files are opened ahead of the batches that read them.
+_WARM_FILES = 16
 
 
 class FileSystem(FileSystemBase):
@@ -878,6 +880,28 @@ class FsspecReader(FileSystemReader):
                     cpu_executor.submit(dst.copy_, src).result()
                     planner.commit_tensor(req, dst)
 
+        # Opening a remote file costs a metadata lookup and a stream setup
+        # before its first byte arrives. Opening the files this rank may read
+        # after its first batch, its own and those of the ranks it may help,
+        # while that batch downloads keeps these round trips out of the later
+        # batches.
+        warm = []
+        if batches and isinstance(self.fs.fs, fsspec.asyn.AsyncFileSystem):
+            first = {rel for rel, _, _ in batches[0]}
+            later = itertools.chain(
+                (rel for b in batches[1:] for rel, _, _ in b),
+                (rel for t in victims.values() for b in t for rel, _, _ in b),
+            )
+            warm = [rel for rel in dict.fromkeys(later) if rel not in first]
+            warm = warm[:_WARM_FILES]
+
+        def warm_files():
+            paths = [self.fs.concat_path(self.path, rel) for rel in warm]
+            n = len(paths)
+            # Best effort: the batches read these files either way.
+            with suppress(Exception):
+                self.fs.fs.cat_ranges(paths, [0] * n, [1] * n, on_error="return")
+
         jobs = collections.deque((fetch_own, i) for i in range(len(batches)))
         if not batches:
             own_done.set()
@@ -916,6 +940,8 @@ class FsspecReader(FileSystemReader):
 
                 try:
                     top_up()
+                    if warm:
+                        threading.Thread(target=warm_files, daemon=True).start()
                     while inflight or received:
                         waiting = [received[0]] if received else []
                         if inflight:
