@@ -6,6 +6,7 @@ import concurrent.futures
 import io
 import itertools
 import os
+import sys
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,7 +16,10 @@ import fsspec
 import fsspec.asyn
 from fsspec.core import url_to_fs
 
+import torch
+import torch._weights_only_unpickler as _weights_only_unpickler
 from torch import Tensor
+from torch.distributed._shard._utils import narrow_tensor_by_index
 from torch.distributed.checkpoint._extension import StreamTransformExtension
 from torch.distributed.checkpoint.filesystem import (
     FileSystemBase,
@@ -30,6 +34,7 @@ from torch.distributed.checkpoint.planner import (
     ReadItem,
 )
 from torch.futures import Future
+from torch.serialization import _load, _open_zipfile_reader
 
 
 if TYPE_CHECKING:
@@ -378,7 +383,30 @@ class FsspecReader(FileSystemReader):
             return items
 
         def decode(req, segs):
-            return self._decode_item(req, _SegmentReader(segs))
+            item_md = self.storage_data[req.storage_index]
+            if (
+                req.type == LoadItemType.BYTE_IO
+                or item_md.transform_descriptors
+                or len(segs) != 1
+            ):
+                return self._decode_item(req, _SegmentReader(segs))
+            # Storages alias the fetched bytes rather than being copied out of
+            # them under the GIL, so ``dst.copy_`` reads the network buffer.
+            with _open_zipfile_reader(_SegmentReader(segs)) as zf:
+                storage = None
+                if zf.has_record("byteorder") and zf.get_record("byteorder") == (
+                    sys.byteorder.encode()
+                ):
+                    storage = torch.frombuffer(segs[0], dtype=torch.uint8)
+                    storage = storage.untyped_storage()
+                tensor = _load(
+                    zf,
+                    "cpu",
+                    _weights_only_unpickler,
+                    overall_storage=storage,
+                    encoding="utf-8",
+                )
+            return narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
 
         with (
             concurrent.futures.ThreadPoolExecutor(
